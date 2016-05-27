@@ -1,4 +1,9 @@
-from proxy2 import *
+import sys
+import ssl
+import socket
+from proxy2 import ThreadingHTTPServer, ProxyRequestHandler
+from BaseHTTPServer import HTTPServer
+
 
 class ThreadingHTTPSServer(ThreadingHTTPServer):
     address_family = socket.AF_INET6
@@ -9,7 +14,8 @@ class ThreadingHTTPSServer(ThreadingHTTPServer):
 
     def get_request(self):
         request, client_address = self.socket.accept()
-        request = ssl.wrap_socket(request, keyfile=self.cakey, certfile=self.cacert, server_side=True)
+        request = ssl.wrap_socket(
+            request, keyfile=self.cakey, certfile=self.cacert, server_side=True)
         return request, client_address
 
     def handle_error(self, request, client_address):
@@ -21,7 +27,8 @@ class ThreadingHTTPSServer(ThreadingHTTPServer):
             return HTTPServer.handle_error(self, request, client_address)
 
 
-def test(HandlerClass=ProxyRequestHandler, ServerClass=ThreadingHTTPSServer, protocol="HTTP/1.1"):
+def test(HandlerClass=ProxyRequestHandler, ServerClass=ThreadingHTTPSServer,
+         protocol="HTTP/1.1"):
     if sys.argv[1:]:
         port = int(sys.argv[1])
     else:
@@ -32,7 +39,7 @@ def test(HandlerClass=ProxyRequestHandler, ServerClass=ThreadingHTTPSServer, pro
     httpd = ServerClass(server_address, HandlerClass)
 
     sa = httpd.socket.getsockname()
-    print "Serving HTTPS Proxy on", sa[0], "port", sa[1], "..."
+    print("Serving HTTPS Proxy on", sa[0], "port", sa[1], "...")
     httpd.serve_forever()
 
 
