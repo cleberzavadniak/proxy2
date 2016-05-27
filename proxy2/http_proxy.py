@@ -23,6 +23,7 @@ from HTMLParser import HTMLParser
 RED = 31
 GREEN = 32
 ORANGE = 33
+CYAN = 36
 
 
 def color_print(c, s):
@@ -353,7 +354,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 
         self.print_req_body(req_body, req)
 
-        color_print(36, res_header_text)
+        color_print(CYAN, res_header_text)
 
         cookies = res.headers.getheaders('Set-Cookie')
         if cookies:
