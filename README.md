@@ -17,17 +17,17 @@ You need to install OpenSSL to intercept HTTPS connections.
 
 ## Usage
 
-Just run as a script:
+Just run as a Python module:
 
 ```
-$ python proxy2.py
+$ python2 -m proxy2
 ```
 
 Above command runs the proxy on tcp/3128.
 To use another port, specify the port number as the first argument.
 
 ```
-$ python proxy2.py 8080
+$ python2 -m proxy2 8080
 ```
 
 
@@ -36,7 +36,7 @@ $ python proxy2.py 8080
 To intercept HTTPS connections, generate private keys and a private CA certificate:
 
 ```
-$ ./setup_https_intercept.sh
+$ bin/setup_https_intercept.sh
 ```
 
 Through the proxy, you can access http://proxy2.test/ and install the CA certificate in the browsers.

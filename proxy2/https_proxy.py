@@ -27,8 +27,8 @@ class ThreadingHTTPSServer(ThreadingHTTPServer):
             return HTTPServer.handle_error(self, request, client_address)
 
 
-def test(HandlerClass=ProxyRequestHandler, ServerClass=ThreadingHTTPSServer,
-         protocol="HTTP/1.1"):
+def run(HandlerClass=ProxyRequestHandler, ServerClass=ThreadingHTTPSServer,
+        protocol="HTTP/1.1"):
     if sys.argv[1:]:
         port = int(sys.argv[1])
     else:
@@ -44,4 +44,4 @@ def test(HandlerClass=ProxyRequestHandler, ServerClass=ThreadingHTTPSServer,
 
 
 if __name__ == '__main__':
-    test()
+    run()

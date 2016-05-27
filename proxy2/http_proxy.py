@@ -26,7 +26,7 @@ ORANGE = 33
 
 
 def color_print(c, s):
-    return "\x1b[%dm%s\x1b[0m" % (c, s)
+    print("\x1b[%dm%s\x1b[0m" % (c, s))
 
 
 def parse_qsl(s):
@@ -62,9 +62,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         self.tls = threading.local()
         self.tls.conns = {}
 
-        BaseHTTPRequestHandler.__init__(self, *args, **kwargs)
-
         self.check_for_certificate_files()
+
+        # (Keep this as the last line. Do all your own stuff above this point.)
+        # TODO: change to super() when moving to Python 3:
+        BaseHTTPRequestHandler.__init__(self, *args, **kwargs)
 
     def check_for_certificate_files(self):
         self.certificate_files_okay = (
@@ -349,7 +351,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             token = auth.split()[1].decode('base64')
             color_print(RED, "==== BASIC AUTH ====\n%s\n" % token)
 
-        self.print_req_body(req, req_body)
+        self.print_req_body(req_body, req)
 
         color_print(36, res_header_text)
 
@@ -405,8 +407,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         self.print_info(req, req_body, res, res_body)
 
 
-def test(HandlerClass=ProxyRequestHandler, ServerClass=ThreadingHTTPServer,
-         protocol="HTTP/1.1"):
+def run(HandlerClass=ProxyRequestHandler, ServerClass=ThreadingHTTPServer,
+        protocol="HTTP/1.1"):
     if sys.argv[1:]:
         port = int(sys.argv[1])
     else:
@@ -422,4 +424,4 @@ def test(HandlerClass=ProxyRequestHandler, ServerClass=ThreadingHTTPServer,
 
 
 if __name__ == '__main__':
-    test()
+    run()
