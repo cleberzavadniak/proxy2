@@ -1,3 +1,3 @@
 #!/bin/bash
 
-python2 -m proxy2 $*
+python3 -m proxy2 $*

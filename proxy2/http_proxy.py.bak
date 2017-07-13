@@ -11,11 +11,11 @@ import zlib
 import time
 import json
 import re
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from socketserver import ThreadingMixIn
-from io import StringIO
+from BaseHTTPServer import HTTPServer, BaseHTTPRequestHandler
+from SocketServer import ThreadingMixIn
+from cStringIO import StringIO
 from subprocess import Popen, PIPE
-from html.parser import HTMLParser
+from HTMLParser import HTMLParser
 
 from clint.textui import puts, colored
 

@@ -1,6 +1,8 @@
-# -*- coding: utf-8 -*-
-from proxy2 import *
+import re
 from collections import deque
+
+from proxy2.http_proxy import ProxyRequestHandler
+
 
 class SSLStripRequestHandler(ProxyRequestHandler):
     replaced_urls = deque(maxlen=1024)
