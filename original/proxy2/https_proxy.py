@@ -1,8 +1,8 @@
 import sys
 import ssl
 import socket
-from proxy2 import ThreadingHTTPServer, ProxyRequestHandler
-from BaseHTTPServer import HTTPServer
+from .http_proxy import ThreadingHTTPServer, ProxyRequestHandler
+from http.server import HTTPServer
 
 
 class ThreadingHTTPSServer(ThreadingHTTPServer):
