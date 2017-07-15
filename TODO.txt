@@ -1,0 +1,2 @@
+ - Ask even on "first visit" to the host.
+ - Try not to queue Questions, but "resolvers" capable of re-analysing the rules.
