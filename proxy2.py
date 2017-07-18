@@ -18,8 +18,11 @@ from socketserver import ThreadingMixIn
 from io import BytesIO
 from html.parser import HTMLParser
 
+from clint.textui import puts, colored
 
-import anticrap
+import block
+import hardcache
+import modify
 
 
 def print_color(c, s):
@@ -55,6 +58,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         self.tls = threading.local()
         self.tls.conns = {}
         self.has_certs = False
+        self.has_ca = False
 
         BaseHTTPRequestHandler.__init__(self, *args, **kwargs)
 
@@ -62,14 +66,22 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         pass
 
     def log_error(self, format, *args):
-        # surpress "Request timed out: timeout('timed out',)"
         if isinstance(args[0], socket.timeout):
             return
 
         self.log_message(format, *args)
 
+    def send_error(self, error_number, reason=None):
+        try:
+            super().send_error(error_number, reason)
+        except BrokenPipeError:  # NOQA
+            pass
+
     def do_CONNECT(self):
-        if os.path.isfile(self.cakey) and os.path.isfile(self.cacert) and os.path.isfile(self.certkey) and os.path.isdir(self.certdir):
+        if self.has_ca:
+            self.connect_intercept()
+        elif os.path.isfile(self.cakey) and os.path.isfile(self.cacert) and os.path.isfile(self.certkey) and os.path.isdir(self.certdir):
+            self.has_ca = True
             self.connect_intercept()
         else:
             self.connect_relay()
@@ -77,7 +89,6 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
     def connect_intercept(self):
         hostname = self.path.split(':')[0]
         certpath = "{}/{}.crt".format(self.certdir.rstrip('/'), hostname)
-
         if not self.has_certs:
             with self.lock:
                 if not os.path.isfile(certpath):
@@ -125,8 +136,19 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     break
                 other.sendall(data)
 
+    def pre_response_handler_used(self, req, req_body):
+        data = self.pre_response_handler(req, req_body)
+        if data is not None:
+            self.wfile.write("{} {} {}\r\n".format(self.protocol_version, 200, 'OK').encode('utf-8'))
+            # self.send_header('Content-Type', 'application/x-x509-ca-cert')
+            self.send_header('Content-Length', len(data))
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            self.wfile.write(data)
+            return True
+
     def do_GET(self):
-        if self.path == 'http://proxy2.test/':
+        if self.path == 'http://anticrap/certificates/':
             self.send_cacert()
             return
 
@@ -140,12 +162,12 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             else:
                 req.path = "http://{}{}".format(req.headers['Host'], req.path)
 
+        if self.pre_response_handler_used(req, req_body):
+            return
+
         req_body_modified = self.request_handler(req, req_body)
         if req_body_modified is False:
-            try:
-                self.send_error(403)
-            except BrokenPipeError:  # NOQA
-                pass
+            self.send_error(403)
             return
         elif req_body_modified is not None:
             req_body = req_body_modified
@@ -172,11 +194,12 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             setattr(res, 'headers', res.msg)
             setattr(res, 'response_version', version_table[res.version])
 
-            # support streaming
+            # streaming:
             if 'Content-Length' not in res.headers and 'no-store' in res.headers.get('Cache-Control', ''):
-                self.response_handler(req, req_body, res, '')
+                # self.response_handler(req, req_body, res, '')
                 setattr(res, 'headers', self.filter_headers(res.headers))
-                self.relay_streaming(res)
+                self.relay_streaming(req, res)
+
                 with self.lock:
                     self.save_handler(req, req_body, res, '')
                 return
@@ -189,7 +212,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             return
 
         content_encoding = res.headers.get('Content-Encoding', 'identity')
-        res_body_plain = self.decode_content_body(res_body, content_encoding)
+        try:
+            res_body_plain = self.decode_content_body(res_body, content_encoding)
+        except Exception as ex:
+            if 'Unknown Content-Encoding' in ex.args[0]:
+                res_body_plain = self.decode_content_body(res_body, 'identity')
 
         res_body_modified = self.response_handler(req, req_body, res, res_body_plain)
         if res_body_modified is False:
@@ -205,22 +232,31 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(bytes("{} {} {}\r\n".format(self.protocol_version, res.status, res.reason), 'utf-8'))
         for k, v in list(res.headers.items()):
             self.send_header(k, v)
+
         try:
             self.end_headers()
-        except BrokenPipeError:  # NOQA
+        except (AttributeError, BrokenPipeError, ssl.SSLEOFError):
             pass
-        else:
+
+        try:
             self.wfile.write(res_body)
             self.wfile.flush()
+        except (BrokenPipeError, ssl.SSLEOFError):  # NOQA
+            pass
 
         with self.lock:
             self.save_handler(req, req_body, res, res_body_plain)
 
-    def relay_streaming(self, res):
-        self.wfile.write("%s %d %s\r\n" % (self.protocol_version, res.status, res.reason))
-        for line in res.headers.headers:
-            self.wfile.write(line)
-        self.end_headers()
+    def relay_streaming(self, req, res):
+        puts(colored.magenta('STREAM: {} {}'.format(req.path, res.status)))
+        self.wfile.write(bytes("{} {} {}\r\n".format(self.protocol_version, res.status, res.reason), 'utf-8'))
+
+        self.wfile.write(bytes('{}'.format(res.headers), 'utf-8'))
+
+        if res.status == 204:  # No Content
+            return
+
+        sys.stdout.flush()
         try:
             while True:
                 chunk = res.read(8192)
@@ -388,14 +424,21 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 
 class MyAntiCrapProxy(ProxyRequestHandler):
     def request_handler(self, req, req_body):
-        return anticrap.apply_request_rules(self, req, req_body)
+        return self.blocker.analyse(self, req, req_body)
+
+    def pre_response_handler(self, req, req_body):
+        return self.cache.analyse(self, req, req_body)
 
     def response_handler(self, req, req_body, res, res_body):
-        pass
+        self.cache.analyse_response(self, req, req_body, res, res_body)
+        return self.modifier.analyse(self, req, req_body, res, res_body)
 
     def save_handler(self, req, req_body, res, res_body):
-        # self.print_info(req, req_body, res, res_body)
-        pass
+        if res.status // 100 in (4, 5):
+            # puts(colored.yellow('> {}: {} {}'.format(req.path, res.status, res.reason)))
+            # puts(colored.yellow(str(res_body, 'utf-8')))
+            self.print_info(req, req_body, res, res_body)
+            puts(colored.yellow('^' * 50))
 
 
 def test(HandlerClass=MyAntiCrapProxy, ServerClass=ThreadingHTTPServer, protocol="HTTP/1.1"):
@@ -405,12 +448,10 @@ def test(HandlerClass=MyAntiCrapProxy, ServerClass=ThreadingHTTPServer, protocol
         port = 3128
     server_address = ('', port)
 
-    anticrap.rules.load_rules()
-
-    anticrap_thread = threading.Thread(target=anticrap.run)
-    anticrap_thread.start()
-
     HandlerClass.protocol_version = protocol
+    HandlerClass.blocker = block.Blocker()
+    HandlerClass.modifier = modify.Modifier()
+    HandlerClass.cache = hardcache.HardCache()
     httpd = ServerClass(server_address, HandlerClass)
 
     sa = httpd.socket.getsockname()
