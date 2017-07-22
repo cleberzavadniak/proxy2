@@ -1,7 +1,8 @@
 import os
 
-from clint.textui import puts, colored
+from clint.textui import colored
 
+from utils import puts
 from fnmatch import compile_pattern
 
 
@@ -47,7 +48,8 @@ class Blocker:
 
         for entry, pattern, options in self.block_list:
             if pattern(path) is not None:
-                if not referer or 'referred' in options and host in referer:
+                if 'referred' in options and (not referer or host in referer):
+                    puts(colored.cyan('ALLOWING `{}` because not referred (referrer: {})'.format(path, referer)))
                     return
 
                 puts(colored.yellow('BLOCKING `{}` (rule: `{}` {})'.format(path, entry, options)))
@@ -55,5 +57,4 @@ class Blocker:
                     puts(colored.yellow(' Referer: {}'.format(referer)))
                 return False
 
-        if referer is not None and host not in referer:
-            puts(colored.cyan('ALLOWING `{}` (referrer: {})'.format(path, referer)))
+        puts(colored.cyan('ALLOWING `{}` (referrer: {})'.format(path, referer)))

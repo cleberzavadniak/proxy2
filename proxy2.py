@@ -18,19 +18,17 @@ from socketserver import ThreadingMixIn
 from io import BytesIO
 from html.parser import HTMLParser
 
-from clint.textui import puts, colored
+from clint.textui import colored
+
+from utils import puts
 
 import block
 import hardcache
 import modify
 
 
-def print_color(c, s):
-    print(("\x1b[{}m{}\x1b[0m".format(c, s)))
-
-
-def join_with_script_dir(path):
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+class ForbiddenError(Exception):
+    pass
 
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
@@ -47,20 +45,24 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 
 
 class ProxyRequestHandler(BaseHTTPRequestHandler):
-    cakey = join_with_script_dir('ca.key')
-    cacert = join_with_script_dir('ca.crt')
-    certkey = join_with_script_dir('cert.key')
-    certdir = join_with_script_dir('certs/')
+    cakey = 'certs/ca.key'
+    cacert = 'certs/ca.crt'
+    certkey = 'certs/cert.key'
+    certdir = 'certs/certs/'
     timeout = 5
     lock = threading.Lock()
+    version_table = {10: 'HTTP/1.0', 11: 'HTTP/1.1'}
 
     def __init__(self, *args, **kwargs):
         self.tls = threading.local()
         self.tls.conns = {}
-        self.has_certs = False
+        self.has_certs_for = []
         self.has_ca = False
 
-        BaseHTTPRequestHandler.__init__(self, *args, **kwargs)
+        try:
+            BaseHTTPRequestHandler.__init__(self, *args, **kwargs)
+        except ConnectionResetError as ex:  # NOQA
+            puts(colored.red('{}: {} | {}'.format(ex, args, kwargs)))
 
     def log_message(self, format, *args):
         pass
@@ -73,33 +75,35 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 
     def send_error(self, error_number, reason=None):
         try:
-            super().send_error(error_number, reason)
-        except BrokenPipeError:  # NOQA
-            pass
+            return super().send_error(error_number, reason)
+        except BrokenPipeError as ex:  # NOQA
+            puts(colored.red('{} on send_error({}, {})'.format(ex, error_number, reason)))
 
     def do_CONNECT(self):
         if self.has_ca:
-            self.connect_intercept()
-        elif os.path.isfile(self.cakey) and os.path.isfile(self.cacert) and os.path.isfile(self.certkey) and os.path.isdir(self.certdir):
+            return self.connect_intercept()
+
+        if os.path.isfile(self.cakey) and os.path.isfile(self.cacert) and os.path.isfile(self.certkey) and os.path.isdir(self.certdir):
             self.has_ca = True
-            self.connect_intercept()
-        else:
-            self.connect_relay()
+            return self.connect_intercept()
+
+        return self.connect_relay()
 
     def connect_intercept(self):
         hostname = self.path.split(':')[0]
         certpath = "{}/{}.crt".format(self.certdir.rstrip('/'), hostname)
-        if not self.has_certs:
+        if certpath not in self.has_certs_for:
             with self.lock:
                 if not os.path.isfile(certpath):
                     epoch = str(int(time.time() * 1000))
                     p1 = Popen(["openssl", "req", "-new", "-key", self.certkey, "-subj", "/CN={}".format(hostname)], stdout=PIPE)
                     p2 = Popen(["openssl", "x509", "-req", "-days", "3650", "-CA", self.cacert, "-CAkey", self.cakey, "-set_serial", epoch, "-out", certpath], stdin=p1.stdout, stderr=PIPE)
                     p2.communicate()
-                    self.has_certs = True
+                    puts(colored.white('CREATING CERTS FOR {}'.format(hostname)))
+                    self.has_certs_for.append(certpath)
 
-        self.wfile.write("{} {} {}\r\n".format(self.protocol_version, 200, 'Connection Established').encode('utf-8'))
-        self.wfile.write(b'\r\n')
+        self.output("{} {} {}\r\n".format(self.protocol_version, 200, 'Connection Established'))
+        self.output(b'\r\n', None)
 
         self.connection = ssl.wrap_socket(self.connection, keyfile=self.certkey, certfile=certpath, server_side=True)
         self.rfile = self.connection.makefile("rb", self.rbufsize)
@@ -139,28 +143,22 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
     def pre_response_handler_used(self, req, req_body):
         data = self.pre_response_handler(req, req_body)
         if data is not None:
-            self.wfile.write("{} {} {}\r\n".format(self.protocol_version, 200, 'OK').encode('utf-8'))
-            # self.send_header('Content-Type', 'application/x-x509-ca-cert')
+            self.output("{} {} {}\r\n".format(self.protocol_version, 200, 'OK'))
             self.send_header('Content-Length', len(data))
             self.send_header('Connection', 'close')
             self.end_headers()
-            self.wfile.write(data)
+            self.output(data, None)
             return True
 
     def do_GET(self):
-        if self.path == 'http://anticrap/certificates/':
-            self.send_cacert()
-            return
-
         req = self
         content_length = int(req.headers.get('Content-Length', 0))
         req_body = self.rfile.read(content_length) if content_length else None
+        self.make_req_path_complete(req)
 
-        if req.path[0] == '/':
-            if isinstance(self.connection, ssl.SSLSocket):
-                req.path = "https://{}{}".format(req.headers['Host'], req.path)
-            else:
-                req.path = "http://{}{}".format(req.headers['Host'], req.path)
+        if req.path == 'http://anticrap/certificates/':
+            self.send_cacert()
+            return
 
         if self.pre_response_handler_used(req, req_body):
             return
@@ -171,87 +169,143 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             return
         elif req_body_modified is not None:
             req_body = req_body_modified
-            req.headers['Content-length'] = str(len(req_body))
 
-        u = url_parse.urlsplit(req.path)
+        if req_body:
+            req.headers['Content-Length'] = str(len(req_body))
+
+        try:
+            return self.do_remote_GET(req, req_body)
+        except ForbiddenError:
+            self.send_error(403)
+            return
+
+    def make_req_path_complete(self, req):
+        if req.path[0] == '/':
+            if isinstance(self.connection, ssl.SSLSocket):
+                req.path = "https://{}{}".format(req.headers['Host'], req.path)
+            else:
+                req.path = "http://{}{}".format(req.headers['Host'], req.path)
+
+    def get_url_info(self, path):
+        u = url_parse.urlsplit(path)
         scheme, netloc, path = u.scheme, u.netloc, (u.path + '?' + u.query if u.query else u.path)
         assert scheme in ('http', 'https')
+        return scheme, netloc, path
+
+    def connect_to(self, scheme, netloc):
+        origin = (scheme, netloc)
+        if origin not in self.tls.conns:
+            if scheme == 'https':
+                self.tls.conns[origin] = HTTPSConnection(netloc, timeout=self.timeout)
+            else:
+                self.tls.conns[origin] = HTTPConnection(netloc, timeout=self.timeout)
+        return self.tls.conns[origin]
+
+    def is_success(self, status):
+        return status // 100 == 2
+
+    def is_stream_response(self, res):
+        return 'Content-Length' not in res.headers and 'no-store' in res.headers.get('Cache-Control', '')
+
+    def do_stream(self, req, req_body, res):
+        setattr(res, 'headers', self.filter_headers(res.headers))
+        self.relay_streaming(req, res)
+
+        with self.lock:
+            self.save_handler(req, req_body, res, '')
+
+    def call_response_handler(self, req, req_body, res, res_body_plain):
+        # TEST: modifying response body doen't seem to work on https...
+        return res_body_plain
+
+        res_body_modified = self.response_handler(req, req_body, res, res_body_plain)
+
+        if res_body_modified is not None:
+            print('MODIFIED!')
+            res.headers['Content-Length'] = str(len(res_body_modified))
+            return res_body_modified
+
+        return res_body_plain
+
+    def output(self, data, encoding='utf-8', flush=False, help_text=None):
+        if encoding:
+            bdata = bytes(data, encoding)
+        else:
+            bdata = data
+
+        try:
+            self.wfile.write(bdata)
+            if flush:
+                self.wfile.flush()
+        except (BrokenPipeError, ssl.SSLEOFError) as ex:  # NOQA
+            puts(colored.red('OUTPUT ERROR: {}: {} ({}) ({} bytes)'.format(
+                type(ex), ex, help_text, len(bdata)
+            )))
+
+    def remove_tls_connection(self, origin):
+        if origin in self.tls.conns:
+            del self.tls.conns[origin]
+
+    def do_remote_GET(self, req, req_body):
+        scheme, netloc, path = self.get_url_info(req.path)
+
         if netloc:
             req.headers['Host'] = netloc
         setattr(req, 'headers', self.filter_headers(req.headers))
 
+        conn = self.connect_to(scheme, netloc)
         try:
-            origin = (scheme, netloc)
-            if origin not in self.tls.conns:
-                if scheme == 'https':
-                    self.tls.conns[origin] = HTTPSConnection(netloc, timeout=self.timeout)
-                else:
-                    self.tls.conns[origin] = HTTPConnection(netloc, timeout=self.timeout)
-            conn = self.tls.conns[origin]
             conn.request(self.command, path, req_body, dict(req.headers))
+        except ConnectionRefusedError as ex:  # NOQA
+            puts(colored.red('CONNECTION ERROR: {}: {}'.format(ex, req.path)))
+            return
+
+        try:
             res = conn.getresponse()
-            version_table = {10: 'HTTP/1.0', 11: 'HTTP/1.1'}
             setattr(res, 'headers', res.msg)
-            setattr(res, 'response_version', version_table[res.version])
+            setattr(res, 'response_version', self.version_table[res.version])
 
-            # streaming:
-            if 'Content-Length' not in res.headers and 'no-store' in res.headers.get('Cache-Control', ''):
-                # self.response_handler(req, req_body, res, '')
-                setattr(res, 'headers', self.filter_headers(res.headers))
-                self.relay_streaming(req, res)
+            if self.is_stream_response(res):
+                return self.do_stream(req, req_body, res)
 
-                with self.lock:
-                    self.save_handler(req, req_body, res, '')
-                return
+            for i in range(0, 10):
+                res_body = res.read()
 
-            res_body = res.read()
-        except Exception:
-            if origin in self.tls.conns:
-                del self.tls.conns[origin]
+                if res.status // 100 != 2 or len(res_body) > 0:
+                    break
+        except Exception as ex:
+            origin = (scheme, netloc)
+            self.remove_tls_connection(origin)
             self.send_error(502)
             return
 
         content_encoding = res.headers.get('Content-Encoding', 'identity')
-        try:
-            res_body_plain = self.decode_content_body(res_body, content_encoding)
-        except Exception as ex:
-            if 'Unknown Content-Encoding' in ex.args[0]:
-                res_body_plain = self.decode_content_body(res_body, 'identity')
+        res_body_plain = self.decode_content_body(res_body, content_encoding)
 
-        res_body_modified = self.response_handler(req, req_body, res, res_body_plain)
-        if res_body_modified is False:
-            self.send_error(403)
-            return
-        elif res_body_modified is not None:
-            res_body_plain = res_body_modified
-            res_body = self.encode_content_body(res_body_plain, content_encoding)
-            res.headers['Content-Length'] = str(len(res_body))
+        # TEST
+        # res_body_plain = self.call_response_handler(req, req_body, res, res_body_plain)
+        # res_body = self.encode_content_body(res_body_plain, content_encoding)
 
         setattr(res, 'headers', self.filter_headers(res.headers))
-
-        self.wfile.write(bytes("{} {} {}\r\n".format(self.protocol_version, res.status, res.reason), 'utf-8'))
+        self.output("{} {} {}\r\n".format(self.protocol_version, res.status, res.reason), help_text='Response header for {}'.format(req.path))
         for k, v in list(res.headers.items()):
             self.send_header(k, v)
+        self.end_headers()
 
-        try:
-            self.end_headers()
-        except (AttributeError, BrokenPipeError, ssl.SSLEOFError):
-            pass
-
-        try:
-            self.wfile.write(res_body)
+        if len(res_body) == 0 and res.status == 304:  # Not Modified...
             self.wfile.flush()
-        except (BrokenPipeError, ssl.SSLEOFError):  # NOQA
-            pass
+        else:
+            if len(res_body) != int(res.headers.get('Content-Length', 0)):
+                print('WRONG SIZE FOR {}: {} versus {}'.format(req.path, len(res_body), res.headers.get('Content-Length')))
+            self.output(res_body, None, flush=True, help_text='Response body for {}'.format(req.path))
 
         with self.lock:
             self.save_handler(req, req_body, res, res_body_plain)
 
     def relay_streaming(self, req, res):
         puts(colored.magenta('STREAM: {} {}'.format(req.path, res.status)))
-        self.wfile.write(bytes("{} {} {}\r\n".format(self.protocol_version, res.status, res.reason), 'utf-8'))
-
-        self.wfile.write(bytes('{}'.format(res.headers), 'utf-8'))
+        self.output("{} {} {}\r\n".format(self.protocol_version, res.status, res.reason), help_text='Stream response header for {}'.format(req.path))
+        self.output('{}'.format(res.headers), help_text='Stream response headers for {}'.format(req.path))
 
         if res.status == 204:  # No Content
             return
@@ -264,9 +318,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
             self.wfile.flush()
-        except socket.error:
+        except socket.error as ex:
             # connection closed by client
-            pass
+            puts(colored.red('OUTPUT STREAM ERROR: {}: {} ({})'.format(type(ex), ex, req.path)))
 
     do_HEAD = do_GET
     do_POST = do_GET
@@ -290,75 +344,83 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 
     def encode_content_body(self, text, encoding):
         if encoding == 'identity':
-            data = text
-        elif encoding in ('gzip', 'x-gzip'):
+            return text
+
+        if encoding in ('gzip', 'x-gzip'):
             io = BytesIO()
             with gzip.GzipFile(fileobj=io, mode='wb') as f:
                 f.write(text)
-            data = io.getvalue()
-        elif encoding == 'deflate':
-            data = zlib.compress(text)
-        else:
-            raise Exception("Unknown Content-Encoding: {}".format(encoding))
-        return data
+            return io.getvalue()
+
+        if encoding == 'deflate':
+            return zlib.compress(text)
+
+        puts(colored.red('encode_content_body: using identity for {}'.format(encoding)))
+        return text
 
     def decode_content_body(self, data, encoding):
         if encoding == 'identity':
-            text = data
-        elif encoding in ('gzip', 'x-gzip'):
+            return data
+
+        if encoding in ('gzip', 'x-gzip'):
             io = BytesIO(data)
             with gzip.GzipFile(fileobj=io, mode='rb') as f:
-                text = f.read()
-        elif encoding == 'deflate':
+                return f.read()
+
+        if encoding == 'deflate':
             try:
-                text = zlib.decompress(data)
+                return zlib.decompress(data)
             except zlib.error:
-                text = zlib.decompress(data, -zlib.MAX_WBITS)
-        else:
-            raise Exception("Unknown Content-Encoding: {}".format(encoding))
-        return text
+                return zlib.decompress(data, -zlib.MAX_WBITS)
+
+        puts(colored.red('decode_content_body: using identity for {}'.format(encoding)))
+        return data
 
     def send_cacert(self):
         with open(self.cacert, 'rb') as f:
             data = f.read()
 
-        self.wfile.write("{} {} {}\r\n".format(self.protocol_version, 200, 'OK').encode('utf-8'))
+        self.output("{} {} {}\r\n".format(self.protocol_version, 200, 'OK'))
         self.send_header('Content-Type', 'application/x-x509-ca-cert')
-        self.send_header('Content-Length', len(data))
+        self.send_header('Content-Length', str(len(data)))
         self.send_header('Connection', 'close')
         self.end_headers()
-        self.wfile.write(data)
+        self.output(data, None)
 
-    def print_info(self, req, req_body, res, res_body):
-        def parse_qsl(s):
-            return '\n'.join("{:<20} {}".format(k, v) for k, v in url_parse.parse_qsl(s, keep_blank_values=True))
+    def end_headers(self, *args, **kwargs):
+        try:
+            super().end_headers(*args, **kwargs)
+        except (AttributeError, BrokenPipeError, ssl.SSLEOFError) as ex:  # NOQA
+            puts(colored.red('{} on end_headers'.format(ex)))
 
-        req_header_text = "{} {} {}\n{}".format(req.command, req.path, req.request_version, req.headers)
-        res_header_text = "{} {} {}\n{}".format(res.response_version, res.status, res.reason, res.headers)
+    def parse_qsl(self, s):
+        return '\n'.join("{:<20} {}".format(k, v) for k, v in url_parse.parse_qsl(s, keep_blank_values=True))
 
-        print_color(33, req_header_text)
-
-        u = url_parse.urlsplit(req.path)
-        if u.query:
-            query_text = parse_qsl(u.query)
-            print_color(32, "==== QUERY PARAMETERS ====\n{}\n".format(query_text))
-
+    def print_cookies_info(self, req):
         cookie = req.headers.get('Cookie', '')
         if cookie:
-            cookie = parse_qsl(re.sub(r';\s*', '&', cookie))
-            print_color(32, "==== COOKIE ====\n{}\n".format(cookie))
+            cookie = self.parse_qsl(re.sub(r';\s*', '&', cookie))
+            puts(colored.green("==== COOKIE ====\n{}\n".format(cookie)))
 
+    def print_query_parameters_info(self, req):
+        u = url_parse.urlsplit(req.path)
+        if u.query:
+            query_text = self.parse_qsl(u.query)
+            puts(colored.green("==== QUERY PARAMETERS ====\n{}\n".format(query_text)))
+
+    def print_authorization_info(self, req):
         auth = req.headers.get('Authorization', '')
         if auth.lower().startswith('basic'):
             token = auth.split()[1].decode('base64')
-            print_color(31, "==== BASIC AUTH ====\n{}\n".format(token))
+            puts(colored.red("==== BASIC AUTH ====\n{}\n".format(token)))
 
+    def print_req_body_text(self, req, req_body):
         if req_body is not None:
             req_body_text = None
             content_type = req.headers.get('Content-Type', '')
 
             if content_type.startswith('application/x-www-form-urlencoded'):
-                req_body_text = parse_qsl(req_body)
+                req_body_text = self.parse_qsl(req_body)
             elif content_type.startswith('application/json'):
                 try:
                     json_obj = json.loads(req_body)
@@ -374,18 +436,18 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 req_body_text = req_body
 
             if req_body_text:
-                print_color(32, "==== REQUEST BODY ====\n{}\n".format(req_body_text))
+                puts(colored.green("==== REQUEST BODY ====\n{}\n".format(req_body_text)))
 
-        print_color(36, res_header_text)
-
+    def print_set_cookie_info(self, res):
         if hasattr(res.headers, 'getheaders'):
             cookies = res.headers.getheaders('Set-Cookie')
         else:
             cookies = res.headers.get_all('Set-Cookie')
         if cookies:
             cookies = '\n'.join(cookies)
-            print_color(31, "==== SET-COOKIE ====\n{}\n".format(cookies))
+            puts(colored.red("==== SET-COOKIE ====\n{}\n".format(cookies)))
 
+    def print_res_body_info(self, res, res_body):
         if res_body is not None:
             res_body_text = None
             content_type = res.headers.get('Content-Type', '')
@@ -405,21 +467,28 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 m = re.search(r'<title[^>]*>\s*([^<]+?)\s*</title>', str(res_body), re.I)
                 if m:
                     h = HTMLParser()
-                    print_color(32, "==== HTML TITLE ====\n{}\n".format(h.unescape(m.group(1))))
+                    puts(colored.green("==== HTML TITLE ====\n{}\n".format(h.unescape(m.group(1)))))
             elif content_type.startswith('text/') and len(res_body) < 1024:
                 res_body_text = res_body
 
             if res_body_text:
-                print_color(32, "==== RESPONSE BODY ====\n{}\n".format(res_body_text))
+                puts(colored.green("==== RESPONSE BODY ====\n{}\n".format(res_body_text)))
 
-    def request_handler(self, req, req_body):
-        pass
+    def print_info(self, req, req_body, res, res_body):
+        req_header_text = "{} {} {}\n{}".format(req.command, req.path, req.request_version, req.headers)
+        res_header_text = "{} {} {}\n{}".format(res.response_version, res.status, res.reason, res.headers)
 
-    def response_handler(self, req, req_body, res, res_body):
-        pass
+        puts(colored.magenta(req_header_text))
 
-    def save_handler(self, req, req_body, res, res_body):
-        self.print_info(req, req_body, res, res_body)
+        self.print_query_parameters_info(req)
+        self.print_cookies_info(req)
+        self.print_authorization_info(req)
+        self.print_req_body_text(req, req_body)
+
+        puts(colored.cyan(res_header_text))
+
+        self.print_set_cookie_info(res)
+        self.print_res_body_info(res, res_body)
 
 
 class MyAntiCrapProxy(ProxyRequestHandler):
@@ -435,10 +504,12 @@ class MyAntiCrapProxy(ProxyRequestHandler):
 
     def save_handler(self, req, req_body, res, res_body):
         if res.status // 100 in (4, 5):
-            # puts(colored.yellow('> {}: {} {}'.format(req.path, res.status, res.reason)))
-            # puts(colored.yellow(str(res_body, 'utf-8')))
-            self.print_info(req, req_body, res, res_body)
-            puts(colored.yellow('^' * 50))
+            try:
+                self.print_info(req, req_body, res, res_body)
+            except:
+                pass
+            else:
+                puts(colored.yellow('^' * 50))
 
 
 def test(HandlerClass=MyAntiCrapProxy, ServerClass=ThreadingHTTPServer, protocol="HTTP/1.1"):
